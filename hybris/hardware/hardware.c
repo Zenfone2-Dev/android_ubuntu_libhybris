@@ -15,11 +15,11 @@
  *
  */
 
+#include <android-config.h>
 #include <dlfcn.h>
 #include <stddef.h>
-#include <errno.h>
-#include <android/hardware/hardware.h>
-#include <hybris/internal/binding.h>
+#include <hardware/hardware.h>
+#include <hybris/common/binding.h>
 
 static void *_libhardware = NULL;
 
@@ -31,9 +31,7 @@ static int (*_hw_get_module_by_class)(const char *class_id, const char *inst, co
 
 static void *_init_lib_hardware()
 {
-	if (!_libhardware)
-		_libhardware = (void *) android_dlopen("/system/lib/libhardware.so", RTLD_LAZY);
-	return _libhardware;
+	_libhardware = (void *) android_dlopen("libhardware.so", RTLD_LAZY);
 }
 
 int hw_get_module(const char *id, const struct hw_module_t **module)

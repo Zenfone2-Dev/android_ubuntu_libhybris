@@ -19,9 +19,9 @@
 
 #include "nativewindowbase.h"
 #include <linux/fb.h>
-#include <android/hardware/gralloc.h>
+#include <hardware/gralloc.h>
 
-#include <list>
+#include <vector>
 
 
 class HWComposerNativeWindowBuffer : public BaseNativeWindowBuffer {
@@ -50,9 +50,8 @@ public:
     void setup(gralloc_module_t* gralloc, alloc_device_t* alloc);
 
 
-    void lockFrontBuffer(HWComposerNativeWindowBuffer **buffer);
-    void unlockFrontBuffer(HWComposerNativeWindowBuffer *buffer);
-
+    int getFenceBufferFd(HWComposerNativeWindowBuffer *buffer);
+    void setFenceBufferFd(HWComposerNativeWindowBuffer *buffer, int fd);
 protected:
     // overloads from BaseNativeWindow
     virtual int setSwapInterval(int interval);
@@ -75,22 +74,25 @@ protected:
     virtual int setBuffersFormat(int format);
     virtual int setBuffersDimensions(int width, int height);
     virtual int setBufferCount(int cnt);
+    virtual void present(HWComposerNativeWindowBuffer *buffer) = 0;
 
 private:
     void destroyBuffers();
+    void allocateBuffers();
 
 private:
     framebuffer_device_t* m_fbDev;
     alloc_device_t* m_alloc;
     unsigned int m_usage;
     unsigned int m_bufFormat;
-    int m_freeBufs;
-    std::list<HWComposerNativeWindowBuffer*> m_bufList;
-    HWComposerNativeWindowBuffer* m_frontBuf;
+    std::vector<HWComposerNativeWindowBuffer*> m_bufList;
+    unsigned int m_bufferCount;
+    unsigned int m_nextBuffer;
 
     int m_width;
     int m_height;
 
+    pthread_mutex_t m_mutex;
 };
 
 #endif

@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#include <android-config.h>
 #include "hwcomposer_window.h"
+#include "hwcomposer.h"
 #include "logging.h"
 
 #include <errno.h>
@@ -23,12 +25,59 @@
 #include <stdio.h>
 #include <unistd.h>
 
-#include <android/android-version.h>
-
 extern "C" {
-#include <android/sync/sync.h>
+#include <sync/sync.h>
 };
  
+
+extern "C" struct ANativeWindow *HWCNativeWindowCreate(unsigned int width, unsigned int height, unsigned int format, HWCPresentCallback present, void *cb_data)
+{
+    class Window : public HWComposerNativeWindow
+    {
+    public:
+        Window(unsigned int w, unsigned int h, unsigned int f, HWCPresentCallback p, void *d)
+            : HWComposerNativeWindow(w, h, f)
+            , cb(p)
+            , cb_data(d)
+        {
+        }
+
+        void present(HWComposerNativeWindowBuffer *b)
+        {
+            cb(cb_data, static_cast<ANativeWindow *>(this), static_cast<ANativeWindowBuffer *>(b));
+        }
+
+        HWCPresentCallback cb;
+        void *cb_data;
+    };
+
+    if (!present)
+        return 0;
+
+    Window *w = new Window(width, height, format, present, cb_data);
+    return w;
+}
+
+extern "C" void HWCNativeWindowDestroy(struct ANativeWindow *window)
+{
+    delete window;
+}
+
+struct _BufferFenceAccessor : public HWComposerNativeWindowBuffer {
+    int get() { return fenceFd; }
+    void set(int fd) { fenceFd = fd; };
+};
+
+extern "C" int HWCNativeBufferGetFence(struct ANativeWindowBuffer *buf)
+{
+    return static_cast<_BufferFenceAccessor *>(buf)->get();
+}
+
+extern "C" void HWCNativeBufferSetFence(struct ANativeWindowBuffer *buf, int fd)
+{
+    static_cast<_BufferFenceAccessor *>(buf)->set(fd);
+}
+
 static pthread_cond_t _cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t _mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -72,18 +121,19 @@ HWComposerNativeWindowBuffer::~HWComposerNativeWindowBuffer()
 ////////////////////////////////////////////////////////////////////////////////
 HWComposerNativeWindow::HWComposerNativeWindow(unsigned int width, unsigned int height, unsigned int format)
 {
+    pthread_mutex_init(&m_mutex, 0);
     m_alloc = NULL;
     m_width = width;
     m_height = height;
     m_bufFormat = format;
-    m_usage = GRALLOC_USAGE_HW_COMPOSER;
-    m_frontBuf = NULL;
+    m_usage = GRALLOC_USAGE_HW_COMPOSER|GRALLOC_USAGE_HW_FB;
+    m_bufferCount = 2;
+    m_nextBuffer = 0;
 }
 
 void HWComposerNativeWindow::setup(gralloc_module_t* gralloc, alloc_device_t* alloc)
 {
     m_alloc = alloc;
-    setBufferCount(2);
 }
 
 HWComposerNativeWindow::~HWComposerNativeWindow()
@@ -97,15 +147,14 @@ void HWComposerNativeWindow::destroyBuffers()
 {
     TRACE("");
 
-    std::list<HWComposerNativeWindowBuffer*>::iterator it = m_bufList.begin();
+    std::vector<HWComposerNativeWindowBuffer*>::iterator it = m_bufList.begin();
     for (; it!=m_bufList.end(); ++it)
     {
         HWComposerNativeWindowBuffer* fbnb = *it;
         fbnb->common.decRef(&fbnb->common);
     }
     m_bufList.clear();
-    m_freeBufs = 0;
-    m_frontBuf = NULL;
+    m_nextBuffer = 0;
 }
 
 
@@ -146,65 +195,35 @@ int HWComposerNativeWindow::dequeueBuffer(BaseNativeWindowBuffer** buffer, int *
 {
     HYBRIS_TRACE_BEGIN("hwcomposer-platform", "dequeueBuffer", "");
 
-    HWComposerNativeWindowBuffer* fbnb=NULL;
+    pthread_mutex_lock(&m_mutex);
 
-    pthread_mutex_lock(&_mutex);
+    // Allocate buffers if the list is empty, typically on the first call
+    if (m_bufList.empty())
+        allocateBuffers();
+    assert(!m_bufList.empty());
+    assert(m_nextBuffer < m_bufList.size());
 
-    HYBRIS_TRACE_BEGIN("hwcomposer-platform", "dequeueBuffer-wait", "");
-#if defined(DEBUG)
 
-    if (m_frontBuf)
-        TRACE("Status: Has front buf %p", m_frontBuf);
+    // Grabe the next available buffer in the list and assign m_nextBuffer to
+    // the next one.
+    HWComposerNativeWindowBuffer *b = m_bufList.at(m_nextBuffer);
+    TRACE("idx=%d, buffer=%p, fence=%d", m_nextBuffer, b, b->fenceFd);
+    *buffer = b;
+    m_nextBuffer++;
+    if (m_nextBuffer >= m_bufList.size())
+        m_nextBuffer = 0;
 
-    std::list<HWComposerNativeWindowBuffer*>::iterator cit = m_bufList.begin();
-    for (; cit != m_bufList.end(); ++cit)
-    {
-        TRACE("Status: Buffer %p with busy %i\n", (*cit), (*cit)->busy);
+    // assign the buffer's fence to fenceFd and close/reset our fd.
+    int fence = b->fenceFd;
+    if (fenceFd)
+        *fenceFd = dup(fence);
+    if (fence != -1) {
+        close(b->fenceFd);
+        b->fenceFd = -1;
     }
-#endif
 
-
-    while (m_freeBufs==0)
-    {
-        pthread_cond_wait(&_cond, &_mutex);
-    }
-
-    while (1)
-    {
-        std::list<HWComposerNativeWindowBuffer*>::iterator it = m_bufList.begin();
-        for (; it != m_bufList.end(); ++it)
-        {
-            if (*it==m_frontBuf)
-                continue;
-            if ((*it)->busy==0)
-            {
-                TRACE("Found a free non-front buffer");
-                break;
-            }
-        }
-        if (it == m_bufList.end())
-        {
-            // have to wait once again 
-            pthread_cond_wait(&_cond, &_mutex);
-            continue;
-        }
-
-        fbnb = *it;
-        break;
-    }
-    HYBRIS_TRACE_END("hwcomposer-platform", "dequeueBuffer-wait", "");
-
-    assert(fbnb!=NULL);
-    fbnb->busy = 1;
-    m_freeBufs--;
-
-    *buffer = fbnb;
-    *fenceFd = -1;
-
-    TRACE("%lu DONE --> %p", pthread_self(), fbnb);
-    pthread_mutex_unlock(&_mutex);
+    pthread_mutex_unlock(&m_mutex);
     HYBRIS_TRACE_END("hwcomposer-platform", "dequeueBuffer", "");
-
     return 0;
 }
 
@@ -229,71 +248,30 @@ int HWComposerNativeWindow::dequeueBuffer(BaseNativeWindowBuffer** buffer, int *
  */
 int HWComposerNativeWindow::queueBuffer(BaseNativeWindowBuffer* buffer, int fenceFd)
 {
-    TRACE("%lu %d", pthread_self(), fenceFd);
-    HWComposerNativeWindowBuffer* fbnb = (HWComposerNativeWindowBuffer*) buffer;
+    HWComposerNativeWindowBuffer* b = (HWComposerNativeWindowBuffer*) buffer;
+    HYBRIS_TRACE_BEGIN("hwcomposer-platform", "queueBuffer", "-%p", b);
+    TRACE("%lu %p %d", pthread_self(), buffer, fenceFd);
 
-    HYBRIS_TRACE_BEGIN("hwcomposer-platform", "queueBuffer", "-%p", fbnb);
-    fbnb->fenceFd = fenceFd;
+    pthread_mutex_lock(&m_mutex);
+    assert(b->fenceFd == -1); // We reset it in dequeue, so it better be -1 still..
+    b->fenceFd = fenceFd;
+    this->present(b);
+    pthread_mutex_unlock(&m_mutex);
 
-    pthread_mutex_lock(&_mutex);
-
-    /* Front buffer hasn't yet been picked up for posting */
-    while (m_frontBuf && m_frontBuf->busy >= 2)
-    {
-           pthread_cond_wait(&_cond, &_mutex);
-    }
-
-    assert(fbnb->busy==1);
-    fbnb->busy = 2;
-    m_frontBuf = fbnb;
-    m_freeBufs++;
-
-    sync_wait(fenceFd, -1);
-    ::close(fenceFd);    
-
-    pthread_cond_signal(&_cond);
-
-    TRACE("%lu %p %p",pthread_self(), m_frontBuf, fbnb);
-    pthread_mutex_unlock(&_mutex);
-    HYBRIS_TRACE_END("hwcomposer-platform", "queueBuffer", "-%p", fbnb);
+    TRACE("%lu %p %d", pthread_self(), b, b->fenceFd);
+    HYBRIS_TRACE_END("hwcomposer-platform", "queueBuffer", "-%p", b);
 
     return 0;
 }
 
-void HWComposerNativeWindow::lockFrontBuffer(HWComposerNativeWindowBuffer **buffer)
+int HWComposerNativeWindow::getFenceBufferFd(HWComposerNativeWindowBuffer *buffer)
 {
-    TRACE("");
-    HWComposerNativeWindowBuffer *buf;
-    pthread_mutex_lock(&_mutex);
-    
-    while (!m_frontBuf)
-    {
-           pthread_cond_wait(&_cond, &_mutex);
-    }
-    
-    assert(m_frontBuf->busy == 2);
-    
-    m_frontBuf->busy = 3;
-    buf = m_frontBuf;
-    pthread_mutex_unlock(&_mutex);
-
-   *buffer = buf;
-    return;
-
+    return buffer->fenceFd;
 }
 
-void HWComposerNativeWindow::unlockFrontBuffer(HWComposerNativeWindowBuffer *buffer)
+void HWComposerNativeWindow::setFenceBufferFd(HWComposerNativeWindowBuffer *buffer, int fd)
 {
-    TRACE("");
-    pthread_mutex_lock(&_mutex);
-    
-    assert(buffer == m_frontBuf);
-    m_frontBuf->busy = 0; 
-
-    pthread_cond_signal(&_cond);
-    pthread_mutex_unlock(&_mutex);
-    
-    return;
+    buffer->fenceFd = fd;
 }
 
 /*
@@ -326,15 +304,13 @@ int HWComposerNativeWindow::cancelBuffer(BaseNativeWindowBuffer* buffer, int fen
     TRACE("");
     HWComposerNativeWindowBuffer* fbnb = (HWComposerNativeWindowBuffer*)buffer;
 
-    pthread_mutex_lock(&_mutex);
+    pthread_mutex_lock(&m_mutex);
 
-    fbnb->busy=0;
+    // Assign the fence so we can pass it on in dequeue when the buffer is
+    // again acquired.
+    fbnb->fenceFd = fenceFd;
 
-    m_freeBufs++;
-
-    pthread_cond_signal(&_cond);
-    pthread_mutex_unlock(&_mutex);
-
+    pthread_mutex_unlock(&m_mutex);
     return 0;
 }
 
@@ -451,12 +427,12 @@ unsigned int HWComposerNativeWindow::transformHint() const
  */
 int HWComposerNativeWindow::setUsage(int usage)
 {
-    int need_realloc = (m_usage != usage);
+    usage |= GRALLOC_USAGE_HW_COMPOSER|GRALLOC_USAGE_HW_FB;
+    int need_realloc = (m_usage != (unsigned int) usage);
     TRACE("usage=x%x realloc=%d", usage, need_realloc);
     m_usage = usage;
     if (need_realloc)
-        this->setBufferCount(m_bufList.size());
-
+        destroyBuffers();
     return NO_ERROR;
 }
 
@@ -469,11 +445,12 @@ int HWComposerNativeWindow::setUsage(int usage)
  */
 int HWComposerNativeWindow::setBuffersFormat(int format)
 {
-    int need_realloc = (format != m_bufFormat);
+    int need_realloc = ((unsigned int) format != m_bufFormat);
     TRACE("format=x%x realloc=%d", format, need_realloc);
     m_bufFormat = format;
     if (need_realloc)
-        this->setBufferCount(m_bufList.size());
+        destroyBuffers();
+
     return NO_ERROR;
 }
 
@@ -482,39 +459,43 @@ int HWComposerNativeWindow::setBuffersFormat(int format)
  * native_window_set_buffer_count(..., count)
  * Sets the number of buffers associated with this native window.
  */
-int HWComposerNativeWindow::setBufferCount(int cnt)
+int HWComposerNativeWindow::setBufferCount(int count)
 {
-    TRACE("cnt=%d", cnt);
-    int err=NO_ERROR;
-    pthread_mutex_lock(&_mutex);
+    TRACE("cnt=%d", count);
+    if ((unsigned int) count != m_bufferCount)
+        destroyBuffers();
+    m_bufferCount = count;
+    return NO_ERROR;
+}
 
-    destroyBuffers();
+void HWComposerNativeWindow::allocateBuffers()
+{
+    // This function gets called from dequeue which already locked
+    // m_mutex, so we do this without locking here.
+    TRACE("cnt=%d", m_bufferCount);
 
-    for(unsigned int i = 0; i < cnt; i++)
+    for(unsigned int i = 0; i < m_bufferCount; i++)
     {
-        HWComposerNativeWindowBuffer *fbnb = new HWComposerNativeWindowBuffer(m_alloc,
-                            m_width, m_height, m_bufFormat,
-                            m_usage|GRALLOC_USAGE_HW_COMPOSER);
+        HWComposerNativeWindowBuffer *b
+         = new HWComposerNativeWindowBuffer(m_alloc, m_width, m_height, m_bufFormat, m_usage);
 
-        fbnb->common.incRef(&fbnb->common);
+        b->common.incRef(&b->common);
 
         TRACE("buffer %i is at %p (native %p),err=%s, handle=%p stride=%i",
-                i, fbnb, (ANativeWindowBuffer*)fbnb,
-                strerror(-fbnb->status), fbnb->handle, fbnb->stride);
+                i, b, (ANativeWindowBuffer*)b,
+                strerror(-b->status), b->handle, b->stride);
 
-        if (fbnb->status)
-        {
-            fbnb->common.decRef(&fbnb->common);
-            fprintf(stderr,"WARNING: %s: allocated only %d buffers out of %d\n", __PRETTY_FUNCTION__, m_freeBufs, cnt);
+        if (b->status) {
+            b->common.decRef(&b->common);
+            fprintf(stderr,"WARNING: %s: allocated only %d buffers out of %d\n", __PRETTY_FUNCTION__, m_bufList.size(), m_bufferCount);
             break;
         }
 
-        m_freeBufs++;
-        m_bufList.push_back(fbnb);
+        m_bufList.push_back(b);
     }
-    pthread_mutex_unlock(&_mutex);
 
-    return err;
+    // Restart the count, to avoid out-of-bounds access if it shrinked.
+    m_nextBuffer = 0;
 }
 
 /*

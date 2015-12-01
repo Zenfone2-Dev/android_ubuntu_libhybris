@@ -118,8 +118,7 @@ static int send_prop_msg(prop_msg_t *msg,
 	return result;
 }
 
-int property_list(void (*propfn)(const char *key, const char *value, void *cookie),
-		void *cookie)
+int property_list(void (*propfn)(const char *key, const char *value, void *cookie), void *cookie)
 {
 	int err;
 	prop_msg_t msg;
@@ -128,9 +127,9 @@ int property_list(void (*propfn)(const char *key, const char *value, void *cooki
 	msg.cmd = PROP_MSG_LISTPROP;
 
 	err = send_prop_msg(&msg, propfn, cookie);
-	if (err < 0) {
-		return err;
-	}
+	if (err < 0)
+		/* fallback to property cache */
+		hybris_propcache_list((hybris_propcache_list_cb) propfn, cookie);
 
 	return 0;
 }
@@ -168,15 +167,29 @@ int property_get(const char *key, char *value, const char *default_value)
 	if ((key) && (strlen(key) >= PROP_NAME_MAX -1)) return -1;
 	if (value == NULL) return -1;
 
-	if (property_get_socket(key, value, default_value) == 0)
-		return strlen(value);
+
+	// Runtime cache will serialize property lookups within the process.
+	// This will increase latency if multiple threads are doing many
+	// parallel lookups to new properties, but the overhead should
+	// be offset with the caching eventually.
+	runtime_cache_lock();
+	if (runtime_cache_get(key, value) == 0) {
+		ret = value;
+	} else if (property_get_socket(key, value, default_value) == 0) {
+		runtime_cache_insert(key, value);
+		ret = value;
+	}
+	runtime_cache_unlock();
+
+	if (ret)
+		return strlen(ret);
+
 
 	/* In case the socket is not available, search the property file cache by hand */
 	ret = hybris_propcache_find(key);
 
 	if (ret) {
 		strcpy(value, ret);
-		free(ret);
 		return strlen(value);
 	} else if (default_value != NULL) {
 		strcpy(value, default_value);
@@ -197,6 +210,10 @@ int property_set(const char *key, const char *value)
 	if (value == 0) value = "";
 	if (strlen(key) >= PROP_NAME_MAX -1) return -1;
 	if (strlen(value) >= PROP_VALUE_MAX -1) return -1;
+
+	runtime_cache_lock();
+	runtime_cache_remove(key);
+	runtime_cache_unlock();
 
 	memset(&msg, 0, sizeof(msg));
 	msg.cmd = PROP_MSG_SETPROP;
